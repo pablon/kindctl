@@ -2,11 +2,16 @@
 
 CLI wrapper for [kind](https://kind.sigs.k8s.io/) that creates fully-configured local Kubernetes clusters with one command.
 
+**Version:** 0.1.0
+
 ## Features
 
 - Interactive cluster creation with version selection via `fzf`
 - Auto-installs: MetalLB, ingress-nginx, cert-manager, Caretta
 - Separate kubeconfig per cluster (`~/.kube/configs/`)
+- Optional port mappings (80/443) with conflict detection
+- Multi-node cluster support (up to 3 nodes)
+- Automation support with `--yes` flag
 - Works great with [kubie](https://github.com/kubie-org/kubie)
 
 ## Requirements
@@ -16,23 +21,26 @@ CLI wrapper for [kind](https://kind.sigs.k8s.io/) that creates fully-configured 
 ## Usage
 
 ```bash
-kindctl new [name] [-d]   # Create cluster (-d for dry-run)
-kindctl get               # Get kubeconfig for existing cluster
-kindctl del [name]        # Delete cluster
-kindctl -h                # Help
-```
+kindctl <command> [name] [options]
 
-## Example
+Commands:
+  new [name]       create a cluster
+  list             list all clusters with kubeconfig locations
+  status [name]    show cluster status and health
+  del [name]       delete an existing cluster
 
-```bash
-# Create a new cluster (interactive prompts for name, version, nodes)
-kindctl new
+Options:
+  -d, --dry-run    preview changes without executing
+  -y, --yes        skip confirmation prompts
+  -h, --help       show this help
+  -v, --version    show version
 
-# Preview what would be created
-kindctl new my-cluster -d
-
-# Create cluster with specific name
-kindctl new my-cluster
+Examples:
+  kindctl new              # Interactive cluster creation
+  kindctl new demo -d      # Dry-run for cluster 'demo'
+  kindctl list             # List all clusters
+  kindctl status demo      # Check cluster 'demo' status
+  kindctl del demo -y      # Delete cluster 'demo' without confirmation
 ```
 
 ## Contributing
@@ -41,4 +49,4 @@ kindctl new my-cluster
 
 ## License
 
-[GPL v3.0](LICENSE.md) - feel free to use, modify, and share.
+[GPL v3.0](LICENSE) - feel free to use, modify, and share.
