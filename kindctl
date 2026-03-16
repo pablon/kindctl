@@ -238,8 +238,24 @@ check_port_conflicts() {
   local conflicts=()
 
   for port in "${ports[@]}"; do
-    if lsof -Pi ":$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
-      conflicts+=("$port")
+    local pids
+    pids=$(lsof -Pi ":$port" -sTCP:LISTEN -t 2>/dev/null) || true
+    if [[ -n "$pids" ]]; then
+      local real_conflict=false
+      while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        local proc_path
+        proc_path=$(ps -p "$pid" -o comm= 2>/dev/null) || true
+        # On macOS, skip system processes that report listening on ports
+        # but don't actually block binding (e.g. com.apple.WebKit.Networking)
+        if [[ "$proc_path" != /System/* ]] && [[ "$proc_path" != *com.apple.* ]]; then
+          real_conflict=true
+          break
+        fi
+      done <<< "$pids"
+      if [[ "$real_conflict" == "true" ]]; then
+        conflicts+=("$port")
+      fi
     fi
   done
 
