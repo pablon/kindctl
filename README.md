@@ -3,7 +3,7 @@
 Pure bash CLI wrapper for [kind](https://kind.sigs.k8s.io/) that creates
 fully-configured local Kubernetes clusters with one command.
 
-**Version:** 0.1.0
+**Version:** 0.1.1
 
 ## Features
 

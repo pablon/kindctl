@@ -3,7 +3,7 @@
 ##########################################################
 # Description:  kind wrapper tool for local kuberetes cluster management
 # Author:       https://github.com/pablon
-# Version:      0.1.0
+# Version:      0.1.1
 #
 # Usage:
 # kindctl <command> [name] [-d]
@@ -18,7 +18,7 @@
 ##########################################################
 set -euo pipefail
 
-readonly KINDCTL_VERSION="0.1.0"
+readonly KINDCTL_VERSION="0.1.1"
 
 # preferred location to store kubeconfig files
 # each cluster uses a separate kubeconfig file to make it easier to manage
