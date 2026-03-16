@@ -3,44 +3,80 @@
 ##########################################################
 # Description:  kind wrapper tool for local kuberetes cluster management
 # Author:       https://github.com/pablon
+# Version:      0.1.0
 #
 # Usage:
 # kindctl <command> [name] [-d]
 #   new [name] [-d]  create a cluster (use -d for dry-run)
-#   get              get kubeconfig for cluster
+#   list             list all clusters
+#   status [name]    show cluster status
 #   del [name]       delete an existing cluster
 #   -h               this help
+#   -v               show version
 #
 # Dependencies: curl, fzf, jq, docker, helm, kind, kubectl
 ##########################################################
 set -euo pipefail
 
+readonly KINDCTL_VERSION="0.1.0"
+
 # preferred location to store kubeconfig files
 # each cluster uses a separate kubeconfig file to make it easier to manage
 # works best for kubie (https://github.com/kubie-org/kubie)
-KUBECONFIG_DIR="${HOME}/.kube/configs"
+readonly KUBECONFIG_DIR="${HOME}/.kube/configs"
+
+# Global flags
+ASSUME_YES=false
+ENABLE_PORT_MAPPINGS=false
 
 CYAN="\033[1;96m"
 GREEN="\033[1;92m"
 MAGENTA="\033[1;95m"
 RED="\033[1;31m"
 YELLOW="\033[1;93m"
+STRONG="\033[1m"
 NC="\033[0m"
 
+# Cleanup handler
+cleanup() {
+  local exit_code=$?
+  if [[ -n "${KIND_CONFIG:-}" ]] && [[ -f "${KIND_CONFIG}" ]]; then
+    rm -f "${KIND_CONFIG}"
+  fi
+  exit "$exit_code"
+}
+trap cleanup EXIT ERR INT TERM
+
 divider() {
-  [[ "${COLUMNS}" ]] || local COLUMNS=80
+  local COLUMNS=${COLUMNS:-80}
   echo -e "${CYAN}$(eval "printf '─%.0s' {1..$COLUMNS}")${NC}"
 }
 
 show_help() {
   cat <<HELP
-$(basename -- "$0"): kind wrapper tool for local kuberetes cluster management
+v${KINDCTL_VERSION}: 
+kind wrapper tool for local kubernetes cluster management
 
-Usage: $(basename -- "$0") <command> [name] [-d]
-  new [name] [-d]  create a cluster (use -d for dry-run)
-  get              get kubeconfig for cluster
+Usage: $(basename -- "$0") <command> [name] [options]
+
+Commands:
+  new [name]       create a cluster
+  list             list all clusters
+  status [name]    show cluster status and health
   del [name]       delete an existing cluster
-  -h               this help
+
+Options:
+  -d, --dry-run    preview changes without executing
+  -y, --yes        skip confirmation prompts
+  -h, --help       show this help
+  -v, --version    show version
+
+Examples:
+  $(basename -- "$0") new              # Interactive cluster creation
+  $(basename -- "$0") new demo -d      # Dry-run for cluster 'demo'
+  $(basename -- "$0") list             # List all clusters
+  $(basename -- "$0") status demo      # Check cluster 'demo' status
+  $(basename -- "$0") del demo -y      # Delete cluster 'demo' without confirmation
 
 HELP
   exit 0
@@ -60,6 +96,37 @@ if [ "${#deps_missing[@]}" -gt "0" ]; then
   exit 1
 fi
 
+check_existing_port_mappings() {
+  # Check if any existing kind cluster has port mappings configured
+  local clusters
+  clusters="$(kind get clusters 2>/dev/null)"
+
+  if [[ -z "$clusters" ]]; then
+    return # No clusters exist
+  fi
+
+  # Check each cluster's config for extraPortMappings on ports 80/443
+  while IFS= read -r cluster; do
+    local config="${KUBECONFIG_DIR}/kind-${cluster}.yaml"
+    if [[ -f "$config" ]]; then
+      # Get cluster config and check for port mappings
+      local cluster_config
+      cluster_config=$(kind get kubeconfig --name "$cluster" 2>/dev/null)
+      if [[ -n "$cluster_config" ]]; then
+        # Check if ports 80 or 443 are in use by docker containers for this cluster
+        local containers
+        containers=$(docker ps --filter "name=${cluster}-control-plane" --format "{{.Ports}}" 2>/dev/null)
+        if echo "$containers" | grep -q "0.0.0.0:80\|0.0.0.0:443"; then
+          echo "$cluster"
+          return 0 # Found cluster with port mappings
+        fi
+      fi
+    fi
+  done <<<"$clusters"
+
+  return 1 # No clusters with port mappings found
+}
+
 gather_info() {
   divider
   get_cluster_name() {
@@ -72,14 +139,33 @@ gather_info() {
     done
     export KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME}"
   }
+
   get_node_image_tags() {
     local MAX_RESULTS=20
-    export KIND_NODE_TAG="$(curl -fsSL \
-      "https://hub.docker.com/v2/repositories/kindest/node/tags?page_size=10&ordering=last_updated" |
-      jq -r '.results[].name | select(test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))' |
+    local FALLBACK_VERSION="v1.35.1"
+
+    # Fetch versions from Docker Hub API with error handling
+    local api_response
+    api_response="$(curl -fsSL \
+      "https://hub.docker.com/v2/repositories/kindest/node/tags?page_size=10&ordering=last_updated" 2>&1)" || {
+      echo -e "${RED}Error: Failed to fetch Kubernetes versions from Docker Hub API${NC}"
+      echo -e "${YELLOW}Using fallback version: ${FALLBACK_VERSION}${NC}"
+      export KIND_NODE_TAG="${FALLBACK_VERSION}"
+      export KIND_NODE_VERSION="kindest/node:${KIND_NODE_TAG}"
+      return 0
+    }
+
+    # Parse and display versions
+    export KIND_NODE_TAG="$(echo "${api_response}" |
+      jq -r '.results[].name | select(test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))' 2>/dev/null |
       head -n $MAX_RESULTS | sort -nr | fzf --layout reverse --height 40% --ghost="Select kubernetes version for cluster [${KIND_CLUSTER_NAME}]")"
 
-    [ -z "${KIND_NODE_TAG}" ] && exit 0
+    # Handle user cancellation (Ctrl+C or ESC)
+    if [ -z "${KIND_NODE_TAG}" ]; then
+      echo -e "${YELLOW}Selection cancelled${NC}"
+      exit 0
+    fi
+
     export KIND_NODE_VERSION="kindest/node:${KIND_NODE_TAG}"
   }
   get_cluster_nodes() {
@@ -96,25 +182,112 @@ gather_info() {
       export KIND_WORKER_NODES="$((KIND_CLUSTER_NODES - DEFAULT_NODES))"
     fi
   }
+
+  ask_port_mappings() {
+    # Check if another cluster already has port mappings
+    local existing_cluster
+    existing_cluster=$(check_existing_port_mappings)
+
+    if [[ -n "$existing_cluster" ]]; then
+      echo
+      echo -e "${YELLOW} ⚠️  Port mappings (80/443) are already used by cluster: ${MAGENTA}${existing_cluster}${NC}"
+      echo -e "${YELLOW}    Only ONE cluster can use ports 80/443 at a time${NC}"
+      echo -e "${YELLOW}    Skipping port mapping configuration for this cluster${NC}"
+      export ENABLE_PORT_MAPPINGS=false
+      return
+    fi
+
+    # No conflicts, ask user
+    echo
+    echo -e "${CYAN} 🔌 Port Mappings Configuration${NC}"
+    echo -e "${YELLOW}    Enable extraPortMappings (ports 80/443)?${NC}"
+    echo -e "${YELLOW}    This allows direct HTTP/HTTPS access to the cluster${NC}"
+    echo -e "${YELLOW}    ⚠️  WARNING: Only ONE cluster can use these ports at a time${NC}"
+
+    if [[ "${ASSUME_YES}" == "true" ]]; then
+      echo -e "${GREEN}    Enabled (--yes flag)${NC}"
+      export ENABLE_PORT_MAPPINGS=true
+    else
+      read -rp " ❓ Enable port mappings? [y/N]: " response
+      case "${response,,}" in
+      y | yes)
+        export ENABLE_PORT_MAPPINGS=true
+        echo -e "${GREEN}    Port mappings enabled${NC}"
+        ;;
+      *)
+        export ENABLE_PORT_MAPPINGS=false
+        echo -e "${YELLOW}    Port mappings disabled${NC}"
+        ;;
+      esac
+    fi
+  }
   [ -z "${1}" ] && get_cluster_name
   get_node_image_tags
   get_cluster_nodes
+  ask_port_mappings
+}
+
+check_port_conflicts() {
+  # Only check ports 80/443 if port mappings are enabled
+  # Port 6443 is bound to 127.0.0.1 only (no conflicts between clusters)
+  if [[ "${ENABLE_PORT_MAPPINGS}" != "true" ]]; then
+    return 0 # No port mappings, no conflicts to check
+  fi
+
+  local ports=(80 443)
+  local conflicts=()
+
+  for port in "${ports[@]}"; do
+    if lsof -Pi ":$port" -sTCP:LISTEN -t >/dev/null 2>&1; then
+      conflicts+=("$port")
+    fi
+  done
+
+  if [ "${#conflicts[@]}" -gt 0 ]; then
+    echo -e "${YELLOW} ⚠️ Warning: The following ports are already in use: ${conflicts[*]}${NC}"
+    echo -e "${YELLOW}    This may cause conflicts with the cluster${NC}"
+
+    if [[ "${ASSUME_YES}" == "false" ]]; then
+      read -rp " ❓ Continue anyway? [y/N]: " response
+      case "${response,,}" in
+      y | yes) return 0 ;;
+      *)
+        echo -e "${RED}Aborting cluster creation${NC}"
+        exit 1
+        ;;
+      esac
+    else
+      echo -e "${YELLOW}    Continuing due to --yes flag${NC}"
+    fi
+  fi
 }
 
 create_cluster() {
   local KIND_CLUSTER_NAME="${1}"
+
   gather_info "${1}"
+
+  # Check for port conflicts after gathering info (so we know if port mappings are enabled)
+  if [ "${MODE}" != "dryrun" ]; then
+    check_port_conflicts
+  fi
+
   divider
   mkdir -p "${KUBECONFIG_DIR}"
   local KIND_KUBECONFIG="${KUBECONFIG_DIR}/kind-${KIND_CLUSTER_NAME}.yaml"
-  local KIND_CONFIG="$(mktemp -t "kind-config-${KIND_CLUSTER_NAME}").yaml"
+  # Create temp file with proper template to avoid collision
+  local KIND_CONFIG
+  KIND_CONFIG="$(mktemp -t "kind-config-${KIND_CLUSTER_NAME}.XXXXXX")"
+  mv "${KIND_CONFIG}" "${KIND_CONFIG}.yaml"
+  KIND_CONFIG="${KIND_CONFIG}.yaml"
 
   echo -e " ${CYAN}New cluster: ${GREEN}${KIND_CLUSTER_NAME}${NC}
      ${CYAN}Version:${NC} ${KIND_NODE_VERSION#*v}
        ${CYAN}Nodes:${NC} ${KIND_CLUSTER_NODES}
-  ${CYAN}KUBECONFIG:${NC} ${KIND_KUBECONFIG}"
+  ${CYAN}KUBECONFIG:${NC} ${KIND_KUBECONFIG}
+${CYAN}Port Mappings:${NC} $(if [[ "${ENABLE_PORT_MAPPINGS}" == "true" ]]; then echo -e "${GREEN}Enabled (80/443)${NC}"; else echo -e "${YELLOW}Disabled${NC}"; fi)"
 
-  if [ "${MODE}" != "dryrun" ]; then
+  if [ "${MODE}" != "dryrun" ] && [[ "${ASSUME_YES}" == "false" ]]; then
     echo
     read -rp " ❓ Proceed with cluster creation? [Y/n]: " START
     case "${START}" in
@@ -130,14 +303,12 @@ create_cluster() {
 
   echo
   echo -e "${GREEN} ⚙️ Adding control-plane to kind-config..${NC}"
+
+  # Base control-plane configuration
   cat <<EOF >"${KIND_CONFIG}"
 apiVersion: kind.x-k8s.io/v1alpha4
 kind: Cluster
 name: ${KIND_CLUSTER_NAME}
-networking:
-  apiServerPort: 6443
-  # ipFamily: ipv4
-  # apiServerAddress: 127.0.0.1
 nodes:
   # control-plane
   - role: control-plane
@@ -147,6 +318,11 @@ nodes:
         nodeRegistration:
           kubeletExtraArgs:
             node-labels: "ingress-ready=true"
+EOF
+
+  # Conditionally add extraPortMappings
+  if [[ "${ENABLE_PORT_MAPPINGS}" == "true" ]]; then
+    cat <<EOF >>"${KIND_CONFIG}"
     extraPortMappings:
       - containerPort: 80
         hostPort: 80
@@ -155,6 +331,7 @@ nodes:
         hostPort: 443
         protocol: TCP
 EOF
+  fi
 
   if [ "${KIND_WORKER_NODES:-}" ]; then
     for i in $(seq 1 "${KIND_WORKER_NODES}"); do
@@ -405,38 +582,112 @@ show_final_help() {
   fi
 }
 
-get_kubeconfig() {
-  if [ ! -z "$(kind get clusters)" ]; then
-    export THIS_CLUSTER="$(kind get clusters 2>/dev/null | fzf -1 --layout reverse --border --height 25% --prompt='☸️ ' --ghost="select cluster")"
-    [ -z "${THIS_CLUSTER}" ] && exit 0
-    local KUBECONFIG_RAW="$(kind get kubeconfig --name ${THIS_CLUSTER})"
-    local CLUSTER_AUTHORITY_DATA="$(echo "${KUBECONFIG_RAW}" | yq -r '.clusters[0].cluster."certificate-authority-data"')"
-    export KUBECONFIG_YAML="$(rg -l "${CLUSTER_AUTHORITY_DATA}" "${KUBECONFIG_DIR}"/*)"
-    if [ "${MODE}" == "kubeconfig" ]; then
-      divider
-      echo -e "${GREEN} 󰄤 KUBECONFIG location for cluster [${THIS_CLUSTER}]${NC}:\n   ${KUBECONFIG_YAML}"
-      divider
-      if (type bat &>/dev/null); then
-        echo "${KUBECONFIG_RAW}" | cut -c1-77 | sed '/data:/ s|$|...|' | bat --style=snip -S --paging never -l yaml -
-      else
-        kind get kubeconfig --name "${THIS_CLUSTER}" | cut -c1-77 | sed '/data:/ s|$|...|'
-      fi
-      divider
-    fi
-  else
+list_clusters() {
+  local clusters
+  clusters="$(kind get clusters 2>/dev/null)"
+
+  if [[ -z "$clusters" ]]; then
+    echo -e "${YELLOW} ℹ️  No kind clusters found${NC}"
     exit 0
   fi
+
+  divider
+  echo -e "${GREEN} ☸️  Kind Clusters:${NC}\n"
+  printf "   ${CYAN}%-20s %-15s %-10s %s${NC}\n" "CLUSTER" "VERSION" "NODES" "KUBECONFIG"
+  echo
+
+  while IFS= read -r cluster; do
+    local config="${KUBECONFIG_DIR}/kind-${cluster}.yaml"
+    if [[ -f "$config" ]]; then
+      local version
+      version=$(kubectl version --kubeconfig="$config" --output=json 2>/dev/null | jq -r '.serverVersion.gitVersion' 2>/dev/null || echo "unknown")
+      local node_count
+      node_count=$(kubectl get nodes --kubeconfig="$config" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+      printf "   ${GREEN}%-20s${NC} ${CYAN}%-15s %-10s${NC} %s\n" "$cluster" "$version" "$node_count nodes" "$config"
+    else
+      printf "   ${YELLOW}%-20s${NC} ${RED}%-15s %-10s %s${NC}\n" "$cluster" "unknown" "-" "missing"
+    fi
+  done <<<"$clusters"
+
+  echo
+  divider
+}
+
+status_cluster() {
+  local cluster="${1}"
+
+  # If no cluster specified, use fzf to select
+  if [[ -z "$cluster" ]]; then
+    local clusters
+    clusters="$(kind get clusters 2>/dev/null)"
+    if [[ -z "$clusters" ]]; then
+      echo -e "${YELLOW} ℹ️  No kind clusters found${NC}"
+      exit 0
+    fi
+    cluster="$(echo "$clusters" | fzf -1 --layout reverse --border --height 25% --prompt='☸️ ' --ghost="select cluster for status")"
+    [[ -z "$cluster" ]] && exit 0
+  fi
+
+  # Verify cluster exists
+  if ! kind get clusters 2>/dev/null | grep -q "^${cluster}\$"; then
+    echo -e "${RED} ❌ Cluster '${cluster}' not found${NC}"
+    exit 1
+  fi
+
+  local config="${KUBECONFIG_DIR}/kind-${cluster}.yaml"
+
+  if [[ ! -f "$config" ]]; then
+    echo -e "${RED} ❌ Kubeconfig not found for cluster '${cluster}'${NC}"
+    exit 1
+  fi
+
+  export KUBECONFIG="$config"
+
+  divider
+  echo -e "${GREEN} ☸️  Cluster Status: ${CYAN}${cluster}${NC}\n"
+
+  # Cluster info
+  echo -e "${STRONG}Cluster Info:${NC}"
+  kubectl cluster-info 2>/dev/null || echo -e "${RED}Failed to get cluster info${NC}"
+  echo
+
+  # Nodes
+  echo -e "${STRONG}Nodes:${NC}"
+  kubectl get nodes -o wide 2>/dev/null || echo -e "${RED}Failed to get nodes${NC}"
+  echo
+
+  # System pods
+  echo -e "${STRONG}System Pods:${NC}"
+  kubectl get pods -A -o wide 2>/dev/null | head -20 || echo -e "${RED}Failed to get pods${NC}"
+  echo
+
+  # Services
+  echo -e "${STRONG}Services:${NC}"
+  kubectl get svc -A 2>/dev/null || echo -e "${RED}Failed to get services${NC}"
+
+  divider
 }
 
 delete_cluster() {
   local THIS_CLUSTER="${1}"
   if [[ -z "${THIS_CLUSTER}" ]] || ! kind get clusters 2>/dev/null | grep -q "^${1}\$"; then
-    get_kubeconfig
+    # If no cluster name provided or cluster doesn't exist, prompt with fzf
+    local clusters
+    clusters="$(kind get clusters 2>/dev/null)"
+    if [[ -z "$clusters" ]]; then
+      echo -e "${YELLOW} ℹ️  No kind clusters found${NC}"
+      exit 0
+    fi
+    THIS_CLUSTER="$(echo "$clusters" | fzf -1 --layout reverse --border --height 25% --prompt='☸️ ' --ghost="select cluster to delete")"
+    [[ -z "$THIS_CLUSTER" ]] && exit 0
   fi
+
+  local KUBECONFIG_YAML="${KUBECONFIG_DIR}/kind-${THIS_CLUSTER}.yaml"
+
   if [ "${MODE}" == "delete" ]; then
     if [ ! -z "$(kind get clusters)" ]; then
       echo -e "${YELLOW} ⚠️ WARNING: cluster [${THIS_CLUSTER}] will be deleted !!!${NC}"
-      if [ "${MODE}" != "dryrun" ]; then
+      if [ "${MODE}" != "dryrun" ] && [[ "${ASSUME_YES}" == "false" ]]; then
         read -rp " 🧨 Proceed [y/N]: " DELETE
         case "${DELETE}" in
         Y | y)
@@ -461,6 +712,17 @@ delete_cluster() {
 ################################################################################
 # parse subcommand + arguments
 
+# Handle version and help flags first (before subcommand)
+case "${1:-}" in
+-v | --version)
+  echo "kindctl v${KINDCTL_VERSION}"
+  exit 0
+  ;;
+-h | --help)
+  show_help
+  ;;
+esac
+
 SUBCOMMAND="${1:-}"
 shift 2>/dev/null || true
 
@@ -473,8 +735,16 @@ while [[ $# -gt 0 ]]; do
     echo -e "${RED} 🛟 DRY-RUN -- simulating all commands${NC}"
     shift
     ;;
+  -y | --yes)
+    ASSUME_YES=true
+    shift
+    ;;
   -h | --help)
     show_help
+    ;;
+  -v | --version)
+    echo "kindctl v${KINDCTL_VERSION}"
+    exit 0
     ;;
   -*)
     echo -e "${RED} ❌ Unknown option: $1${NC}"
@@ -493,9 +763,11 @@ new)
   MODE="${MODE:-install}"
   create_cluster "${CLUSTER_NAME}"
   ;;
-get)
-  MODE=kubeconfig
-  get_kubeconfig
+list)
+  list_clusters
+  ;;
+status)
+  status_cluster "${CLUSTER_NAME}"
   ;;
 del | delete | rm)
   MODE=delete
