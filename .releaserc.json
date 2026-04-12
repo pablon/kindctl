@@ -1,0 +1,38 @@
+{
+  "branches": ["master"],
+  "tagFormat": "${version}",
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/changelog",
+      {
+        "changelogFile": "CHANGELOG.md"
+      }
+    ],
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "sed -i 's/readonly KINDCTL_VERSION=\"[^\"]*\"/readonly KINDCTL_VERSION=\"${nextRelease.version}\"/' kindctl && sed -i 's/^# Version:      .*/# Version:      ${nextRelease.version}/' kindctl"
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["CHANGELOG.md", "kindctl"],
+        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+      }
+    ],
+    [
+      "@semantic-release/github",
+      {
+        "assets": [
+          {
+            "path": "kindctl",
+            "label": "kindctl"
+          }
+        ]
+      }
+    ]
+  ]
+}
