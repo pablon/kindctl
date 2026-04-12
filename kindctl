@@ -28,6 +28,10 @@ readonly KUBECONFIG_DIR="${HOME}/.kube/configs"
 # Global flags
 ASSUME_YES=false
 ENABLE_PORT_MAPPINGS=false
+INSTALL_METALLB=true
+INSTALL_INGRESS_NGINX=true
+INSTALL_CERT_MANAGER=true
+INSTALL_CARETTA=true
 
 CYAN="\033[1;96m"
 GREEN="\033[1;92m"
@@ -221,10 +225,54 @@ gather_info() {
       esac
     fi
   }
+
+  ask_components() {
+    echo
+    echo -e "${CYAN} 📦 Components Configuration${NC}"
+    echo -e "${YELLOW}    Select which components to install in the cluster:${NC}"
+
+    local components=("metallb" "ingress-nginx" "cert-manager" "caretta")
+    local flags=("INSTALL_METALLB" "INSTALL_INGRESS_NGINX" "INSTALL_CERT_MANAGER" "INSTALL_CARETTA")
+    local descriptions=(
+      "MetalLB load-balancer (required for LoadBalancer services)"
+      "ingress-nginx controller (required for Ingress resources)"
+      "cert-manager TLS management (self-signed ClusterIssuer included)"
+      "Caretta service dependency map tool (includes Grafana)"
+    )
+
+    if [[ "${ASSUME_YES}" == "true" ]]; then
+      echo -e "${GREEN}    All components enabled (--yes flag)${NC}"
+      export INSTALL_METALLB=true
+      export INSTALL_INGRESS_NGINX=true
+      export INSTALL_CERT_MANAGER=true
+      export INSTALL_CARETTA=true
+      return
+    fi
+
+    for i in "${!components[@]}"; do
+      local component="${components[$i]}"
+      local flag="${flags[$i]}"
+      local description="${descriptions[$i]}"
+      echo
+      echo -e "${CYAN}    ${component}${NC}: ${description}"
+      read -rp " ❓ Install ${component}? [Y/n]: " response
+      case "${response,,}" in
+      n | no)
+        export "${flag}"=false
+        echo -e "${YELLOW}    ${component} skipped${NC}"
+        ;;
+      *)
+        export "${flag}"=true
+        echo -e "${GREEN}    ${component} will be installed${NC}"
+        ;;
+      esac
+    done
+  }
   [ -z "${1}" ] && get_cluster_name
   get_node_image_tags
   get_cluster_nodes
   ask_port_mappings
+  ask_components
 }
 
 check_port_conflicts() {
@@ -397,7 +445,9 @@ get_kind_network_ip_range() {
 }
 
 install_metallb() {
-  if [ "${MODE}" == "dryrun" ]; then
+  if [[ "${INSTALL_METALLB}" != "true" ]]; then
+    [ "${MODE}" == "dryrun" ] && echo -e "${RED} 🛟 DRY-RUN -- metallb skipped (disabled by user)${NC}" || echo -e "${YELLOW} ⏭️  Skipping metallb (disabled by user)${NC}"
+  elif [ "${MODE}" == "dryrun" ]; then
     echo -e "${RED} 🛟 DRY-RUN -- metallb would be installed${NC}"
   else
     export KUBECONFIG="${KIND_KUBECONFIG}"
@@ -437,7 +487,9 @@ EOF
 
 # https://github.com/kubernetes/ingress-nginx/tree/main/charts/ingress-nginx
 install_ingress_nginx() {
-  if [ "${MODE}" == "dryrun" ]; then
+  if [[ "${INSTALL_INGRESS_NGINX}" != "true" ]]; then
+    [ "${MODE}" == "dryrun" ] && echo -e "${RED} 🛟 DRY-RUN -- ingress-nginx skipped (disabled by user)${NC}" || echo -e "${YELLOW} ⏭️  Skipping ingress-nginx (disabled by user)${NC}"
+  elif [ "${MODE}" == "dryrun" ]; then
     echo -e "${RED} 🛟 DRY-RUN -- ingress-nginx would be installed${NC}"
   else
     export KUBECONFIG="${KIND_KUBECONFIG}"
@@ -475,7 +527,9 @@ install_ingress_nginx() {
 
 # https://github.com/cert-manager/cert-manager/tree/master/deploy/charts/cert-manager
 install_cert_manager() {
-  if [ "${MODE}" == "dryrun" ]; then
+  if [[ "${INSTALL_CERT_MANAGER}" != "true" ]]; then
+    [ "${MODE}" == "dryrun" ] && echo -e "${RED} 🛟 DRY-RUN -- cert-manager skipped (disabled by user)${NC}" || echo -e "${YELLOW} ⏭️  Skipping cert-manager (disabled by user)${NC}"
+  elif [ "${MODE}" == "dryrun" ]; then
     echo -e "${RED} 🛟 DRY-RUN -- cert-manager would be installed${NC}"
   else
     create_cert_manager_cluster_issuer() {
@@ -545,7 +599,9 @@ EOF
 
 # https://github.com/groundcover-com/caretta/tree/main/chart
 install_caretta() {
-  if [ "${MODE}" == "dryrun" ]; then
+  if [[ "${INSTALL_CARETTA}" != "true" ]]; then
+    [ "${MODE}" == "dryrun" ] && echo -e "${RED} 🛟 DRY-RUN -- caretta skipped (disabled by user)${NC}" || echo -e "${YELLOW} ⏭️  Skipping caretta (disabled by user)${NC}"
+  elif [ "${MODE}" == "dryrun" ]; then
     echo -e "${RED} 🛟 DRY-RUN -- caretta would be installed${NC}"
   else
     local HELM_REPO="caretta"
